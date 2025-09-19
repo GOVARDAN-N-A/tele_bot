@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Logs
+*.log
+logs/
+*.rotatinglog
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Sensitive keys / config
+*.env
+.env
+config.json
+credentials.json
+*.key
+*.pem
+
+# IDE / editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Python cache / distribution
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Redis / database files if local
+*.rdb
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.swp
