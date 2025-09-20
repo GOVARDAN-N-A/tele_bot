@@ -1262,7 +1262,13 @@ def build_application(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-
+# In build_application() where app.run_webhook is called:
+    app.run_webhook(
+        listen="0.0.0.0", 
+        port=cfg.webhook_port,
+        url_path=f"/{cfg.telegram_bot_token}",  # Path includes bot token
+        webhook_url=f"{cfg.webhook_url}/{cfg.telegram_bot_token}"
+    )
     app.post_init = post_init
     app.post_shutdown = shutdown
     return app
