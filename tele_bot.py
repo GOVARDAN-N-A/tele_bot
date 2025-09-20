@@ -6,15 +6,23 @@ import re
 import time
 import html
 import json
-import aiofiles
 import hashlib
+import sys
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Set
 from enum import Enum
+from functools import wraps
+import pickle
+import tzlocal
+
+# Third-party libraries
 import httpx
 from dotenv import load_dotenv
+import redis.asyncio as redis
+from cryptography.fernet import Fernet
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -23,14 +31,12 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    JobQueue,
     ContextTypes,
     filters,
 )
-import contextlib
-from functools import wraps
-import pickle
-import redis.asyncio as redis
-from cryptography.fernet import Fernet
+
+import pytz
 
 # ========================== CONFIG / SETUP ==========================
 load_dotenv()
@@ -108,25 +114,43 @@ def setup_logging():
     logger = logging.getLogger("TheriyadhuBot")
     logger.setLevel(logging.INFO)
     
-    # Console handler
-    console_handler = logging.StreamHandler()
+    # --- FIX: Console handler with UTF-8 encoding for Windows ---
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
-    
+
+    # Force the stream to use UTF-8 to prevent UnicodeEncodeError on Windows
+    if sys.stdout.encoding != 'utf-8':
+        try:
+            import codecs
+            console_handler.stream = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+        except (AttributeError, TypeError, LookupError):
+            pass
+    # ------------------------------------------------------------
+
     # File handler with rotation
-    file_handler = RotatingFileHandler(
-        "bot.log", maxBytes=10*1024*1024, backupCount=5
-    )
-    file_handler.setLevel(logging.DEBUG)
-    
+    try:
+        file_handler = RotatingFileHandler(
+            "bot.log", maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
+        )
+        file_handler.setLevel(logging.DEBUG)
+    except Exception as e:
+        print(f"Could not set up file logging: {e}")
+        file_handler = None
+
     # Formatter
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(funcName)s:%(lineno)d | %(message)s"
     )
     console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
+    if file_handler:
+        file_handler.setFormatter(formatter)
     
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
+    # Add handlers to logger
+    # Avoid duplicate handlers if setup_logging is called multiple times
+    if not logger.handlers:
+        logger.addHandler(console_handler)
+        if file_handler:
+            logger.addHandler(file_handler)
     
     return logger
 
@@ -179,7 +203,8 @@ class CacheManager:
     async def connect(self):
         if self.redis_url:
             try:
-                self.redis_client = redis.from_url(self.redis_url)
+                # For aioredis v2+ / redis-py v4+
+                self.redis_client = redis.from_url(self.redis_url, decode_responses=False)
                 logger.info("Connected to Redis cache")
             except Exception as e:
                 logger.error(f"Failed to connect to Redis: {e}")
@@ -234,7 +259,17 @@ class UserManager:
         self.encryption_key = encryption_key
         self.fernet = None
         if encryption_key:
-            self.fernet = Fernet(encryption_key.encode()[:32].ljust(32, b'0'))
+            try:
+                key = encryption_key.encode()
+                # Ensure key is 32 url-safe base64-encoded bytes
+                if len(key) < 32:
+                    key = key.ljust(32, b'0')
+                elif len(key) > 32:
+                    key = key[:32]
+                self.fernet = Fernet(key)
+            except Exception as e:
+                logger.error(f"Failed to initialize Fernet: {e}")
+
     
     async def get_user(self, user_id: int) -> Dict[str, Any]:
         # Check cache first
@@ -312,15 +347,15 @@ class Analytics:
 # ========================== ENHANCED TEXT FORMATTING ==========================
 class TextFormatter:
     CODE_BLOCK_RE = re.compile(r"```(?:\s*(\w+))?\n([\s\S]*?)\n```")
-    INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+    INLINE_CODE_RE = re.compile(r"(?<!`)`([^`]+)`(?!`)")
     BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
     ITALIC_STAR_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
     ITALIC_UNDER_RE = re.compile(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)")
-    # Fixed regex for inline KaTeX expressions
-    LINK_RE = re.compile(
-    r"""```math\s+([\s\S]+?)```KATEX_INLINE_OPEN([\s\S]+?)KATEX_INLINE_CLOSE""",
-    re.MULTILINE
-)
+    
+    # Fixed regex for links: [text](url)
+    LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+# Removed invalid regular expression pattern
+    
     HEADING_RE = re.compile(r"^(#{1,6})\s*(.+)$", re.MULTILINE)
     BULLET_RE = re.compile(r"^\s*[\-\+\*]\s+", re.MULTILINE)
     NUMBERED_RE = re.compile(r"^\s*\d+\.\s+", re.MULTILINE)
@@ -333,7 +368,7 @@ class TextFormatter:
     
     @classmethod
     def markdown_to_html(cls, text: str) -> str:
-        # Code blocks first (to preserve content)
+        # 1. Code blocks (must be first to protect content)
         def code_block_sub(m: re.Match) -> str:
             lang = m.group(1) or ""
             content = html.escape(m.group(2))
@@ -342,73 +377,59 @@ class TextFormatter:
             return f"<pre><code>{content}</code></pre>"
         text = cls.CODE_BLOCK_RE.sub(code_block_sub, text)
         
-        # Inline code
+        # 2. Inline code
         text = cls.INLINE_CODE_RE.sub(lambda m: f"<code>{html.escape(m.group(1))}</code>", text)
         
-        # Links
+        # 3. Links
         text = cls.LINK_RE.sub(lambda m: f'<a href="{html.escape(m.group(2))}">{html.escape(m.group(1))}</a>', text)
         
-        # Text formatting
+        # 4. Text formatting (bold, italic)
         text = cls.BOLD_RE.sub(r"<b>\1</b>", text)
         text = cls.ITALIC_STAR_RE.sub(r"<i>\1</i>", text)
         text = cls.ITALIC_UNDER_RE.sub(r"<i>\1</i>", text)
         
-        # Headings
+        # 5. Block-level elements (headings, lists, blockquotes)
         def heading_sub(m: re.Match) -> str:
             level = len(m.group(1))
             title = m.group(2).strip()
-            if level <= 2:
-                return f"<b><u>{title}</u></b>"
-            return f"<b>{title}</b>"
+            # Telegram doesn't support real headings, use bold/underline
+            return f"<b>{title}</b>\n"
         text = cls.HEADING_RE.sub(heading_sub, text)
         
-        # Lists
         text = cls.BULLET_RE.sub("• ", text)
-        text = cls.NUMBERED_RE.sub(lambda m: f"{m.group(0)}", text)
         
-        # Blockquotes
+        # For numbered lists, just ensure they are on new lines
+        # Telegram handles them okay if they are "1. Text"
+        
         text = cls.BLOCKQUOTE_RE.sub(r"<blockquote>\1</blockquote>", text)
         
         return text
     
     @classmethod
     def sanitize_html(cls, text: str) -> str:
-        # Store allowed tags
+        # Strategy: Temporarily replace allowed tags with placeholders, escape everything, then restore.
         placeholders = {}
-        counter = 0
         
-        def store_tag(tag_content: str) -> str:
-            nonlocal counter
-            key = f"\x00TAG{counter}\x00"
-            placeholders[key] = tag_content
-            counter += 1
-            return key
+        def replace_tag(match):
+            tag_content = match.group(0)
+            placeholder = f"__TAG_{len(placeholders)}__"
+            placeholders[placeholder] = tag_content
+            return placeholder
+
+        # 1. Match all allowed opening and closing tags
+        pattern = r"</?(?:" + "|".join(cls.ALLOWED_TAGS) + r")(?:\s+[^>]*)?>"
         
-        # Process each allowed tag
-        for tag in cls.ALLOWED_TAGS:
-            # Opening tags with attributes
-            text = re.sub(
-                rf"<\s*{tag}(?:\s+[^>]*)?>",
-                lambda m: store_tag(m.group(0)),
-                text,
-                flags=re.IGNORECASE
-            )
-            # Closing tags
-            text = re.sub(
-                rf"<\s*/\s*{tag}\s*>",
-                lambda m: store_tag(m.group(0)),
-                text,
-                flags=re.IGNORECASE
-            )
+        # Replace allowed tags with placeholders
+        text_with_placeholders = re.sub(pattern, replace_tag, text, flags=re.IGNORECASE)
         
-        # Escape everything else
-        text = html.escape(text)
+        # 2. Escape everything else
+        escaped_text = html.escape(text_with_placeholders)
         
-        # Restore allowed tags
-        for key, val in placeholders.items():
-            text = text.replace(html.escape(key), val).replace(key, val)
-        
-        return text
+        # 3. Restore allowed tags
+        for placeholder, original_tag in placeholders.items():
+            escaped_text = escaped_text.replace(placeholder, original_tag)
+            
+        return escaped_text
     
     @classmethod
     def split_message(cls, text: str, max_len: int = 4096) -> List[str]:
@@ -421,15 +442,20 @@ class TextFormatter:
         
         while len(text) > max_len:
             split_at = -1
+            
+            # Look for the best split point within the limit
+            search_text = text[:max_len+1]
+            
             for pattern in split_patterns:
-                pos = text.rfind(pattern, 0, max_len)
+                pos = search_text.rfind(pattern)
                 if pos > 0:
                     split_at = pos + len(pattern)
                     break
             
-            if split_at == -1:
+            # If no natural break point, force split at max_len
+            if split_at == -1 or split_at > max_len:
                 split_at = max_len
-            
+
             chunks.append(text[:split_at].strip())
             text = text[split_at:].lstrip()
         
@@ -512,6 +538,10 @@ class EnhancedGroqClient:
                 resp = await client.post("/chat/completions", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
+                
+                if "choices" not in data or not data["choices"]:
+                    raise RuntimeError("No choices in Groq response")
+
                 text = data["choices"][0]["message"]["content"].strip()
                 
                 # Cache successful response
@@ -525,11 +555,20 @@ class EnhancedGroqClient:
                 status = e.response.status_code
                 last_error = e
                 
+                try:
+                    error_detail = e.response.json()
+                    logger.error(f"Groq API Error ({status}): {error_detail}")
+                except:
+                    logger.error(f"Groq API Error ({status}): {e.response.text}")
+
+
                 if status == 429:  # Rate limit
                     retry_after = int(e.response.headers.get("retry-after", 2 ** attempt))
+                    logger.warning(f"Rate limited by Groq. Retrying in {retry_after}s")
                     await asyncio.sleep(retry_after)
                 elif status in (500, 502, 503, 504) and attempt < self.max_retries:
                     backoff = self.backoff_base * (2 ** attempt)
+                    logger.warning(f"Groq server error. Retrying in {backoff:.1f}s")
                     await asyncio.sleep(backoff)
                 else:
                     break
@@ -539,9 +578,16 @@ class EnhancedGroqClient:
                 last_error = e
                 if attempt < self.max_retries:
                     backoff = self.backoff_base * (2 ** attempt)
+                    logger.warning(f"Groq connection error. Retrying in {backoff:.1f}s: {e}")
                     await asyncio.sleep(backoff)
                 else:
                     break
+            except Exception as e:
+                 self.error_count += 1
+                 last_error = e
+                 logger.error(f"Unexpected error in Groq client: {e}")
+                 break
+
         
         raise RuntimeError(f"Groq API failed after {self.max_retries} retries: {last_error}")
     
@@ -578,18 +624,25 @@ class ConversationManager:
         })
         
         # Trim if needed
-        if len(self.conversations[user_id]) > self.max_messages:
-            # Keep system message if exists
+        history = self.conversations[user_id]
+        if len(history) > self.max_messages:
+            # Keep system message if exists and is the first message
             system_msg = None
-            if self.conversations[user_id][0]["role"] == "system":
-                system_msg = self.conversations[user_id][0]
+            if history and history[0]["role"] == "system":
+                system_msg = history[0]
             
-            # Keep last max_messages
-            self.conversations[user_id] = self.conversations[user_id][-self.max_messages:]
+            # Get the last 'max_messages' entries
+            trimmed_history = history[-self.max_messages:]
             
-            # Restore system message
-            if system_msg:
-                self.conversations[user_id].insert(0, system_msg)
+            # Restore system message if it was dropped
+            if system_msg and trimmed_history[0] != system_msg:
+                 trimmed_history.insert(0, system_msg)
+                 # Might need one more trim if adding the system message pushed it over
+                 if len(trimmed_history) > self.max_messages:
+                     trimmed_history = [trimmed_history[0]] + trimmed_history[-(self.max_messages-1):]
+
+            self.conversations[user_id] = trimmed_history
+
     
     def clear_history(self, user_id: int):
         if user_id in self.conversations:
@@ -597,24 +650,32 @@ class ConversationManager:
         if user_id in self.summaries:
             del self.summaries[user_id]
     
-    async def summarize_conversation(self, user_id: int, groq_client) -> str:
+    async def summarize_conversation(self, user_id: int, groq_client: EnhancedGroqClient) -> str:
         """Create a summary of the conversation for context"""
         history = self.get_history(user_id)
-        if len(history) < 4:
+        
+        # Filter for user/assistant messages only
+        chat_history = [m for m in history if m["role"] in ("user", "assistant")]
+
+        if len(chat_history) < 4:
             return ""
         
         # Create summary prompt
+        # Truncate history to avoid token limits in the summary request
+        recent_history = chat_history[-6:] 
+        
         summary_messages = [
-            {"role": "system", "content": "Summarize the following conversation in 2-3 sentences."},
-            {"role": "user", "content": str(history)}
+            {"role": "system", "content": "Summarize the following conversation in 2-3 sentences, focusing on the main topic."},
+            {"role": "user", "content": json.dumps(recent_history)}
         ]
         
         try:
-            summary = await groq_client.chat_completion(summary_messages, temperature=0.3, max_tokens=200)
+            # Use a lower token count for summary
+            summary = await groq_client.chat_completion(summary_messages, temperature=0.3, max_tokens=150, use_cache=False)
             self.summaries[user_id] = summary
             return summary
         except Exception as e:
-            logger.error(f"Failed to summarize: {e}")
+            logger.error(f"Failed to summarize for user {user_id}: {e}")
             return ""
 
 # ========================== ENHANCED TELEGRAM HELPERS ==========================
@@ -632,6 +693,9 @@ class TypingAction:
                     await asyncio.sleep(4)
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.error(f"Error in send_typing loop: {e}")
+
         
         self._task = asyncio.create_task(send_typing())
         return self
@@ -643,6 +707,9 @@ class TypingAction:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                 logger.error(f"Error canceling typing task: {e}")
+
 
 def admin_only(func):
     """Decorator to restrict commands to admins only"""
@@ -652,10 +719,16 @@ def admin_only(func):
         user_id = update.effective_user.id
         
         if user_id not in cfg.admin_user_ids:
-            await update.message.reply_text(
-                "⛔ This command is restricted to administrators only.",
-                parse_mode=ParseMode.HTML
-            )
+            if update.message:
+                await update.message.reply_text(
+                    "⛔ This command is restricted to administrators only.",
+                    parse_mode=ParseMode.HTML
+                )
+            elif update.callback_query:
+                 await update.callback_query.answer(
+                    "⛔ Restricted to administrators only.",
+                    show_alert=True
+                )
             return
         
         return await func(update, context)
@@ -667,7 +740,7 @@ def track_usage(event_type: str):
         @wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             analytics: Analytics = context.application.bot_data.get("analytics")
-            if analytics:
+            if analytics and update.effective_user:
                 await analytics.track_event(
                     event_type,
                     update.effective_user.id,
@@ -680,33 +753,26 @@ def track_usage(event_type: str):
 # ========================== ENHANCED SYSTEM PROMPTS ==========================
 SYSTEM_PROMPTS = {
     "default": (
-        "You are Theriyadhu Bot, an advanced AI assistant for Telegram. "
-        "Format all responses using Telegram HTML tags: "
-        "<b>, <i>, <u>, <s>, <code>, <pre>, <a href='...'>, <blockquote>, <tg-spoiler>. "
-        "Be helpful, concise, and accurate. Use formatting to enhance readability."
+        "You are Theriyadhu Bot, an advanced AI assistant. "
+        "Format responses with Telegram HTML: <b>bold</b>, <i>italic</i>, <code>code</code>, <pre>code block</pre>. "
+        "Be helpful, concise, and accurate."
     ),
     "coder": (
-        "You are a coding expert assistant. Focus on clean, efficient code with best practices. "
-        "Use <pre><code> blocks for all code. Include brief explanations only when necessary. "
-        "Format responses with Telegram HTML. Suggest optimizations and alternatives when relevant."
+        "You are a coding expert. Use <pre><code>...</code></pre> for all code. "
+        "Format with Telegram HTML. Provide clean, efficient solutions."
     ),
     "teacher": (
-        "You are an educational assistant. Explain concepts step-by-step with clarity. "
-        "Use examples, analogies, and structured formatting with Telegram HTML tags. "
-        "Break down complex topics into digestible parts. Use bullet points and numbered lists."
+        "You are an educator. Explain concepts clearly. Use <b>bold</b> for key terms and "
+        "bullet points (•) for lists. Format with Telegram HTML."
     ),
     "creative": (
-        "You are a creative writing assistant. Help with storytelling, poetry, and creative content. "
-        "Use vivid language and engaging narrative techniques. Format with Telegram HTML for emphasis."
+        "You are a creative writer. Use vivid language. Format with Telegram HTML for emphasis."
     ),
     "analyst": (
-        "You are a data analyst assistant. Focus on logical analysis, statistics, and insights. "
-        "Present information clearly with structured formatting using Telegram HTML tags. "
-        "Use lists and comparisons to highlight key points."
+        "You are a data analyst. Be logical and structured. Use Telegram HTML for clarity."
     ),
     "short": (
-        "You are a concise assistant. Provide brief, direct answers without unnecessary elaboration. "
-        "Use Telegram HTML formatting sparingly. Get straight to the point."
+        "Be brief. Use minimal HTML formatting."
     ),
 }
 
@@ -722,25 +788,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create inline keyboard
     keyboard = [
         [
-            InlineKeyboardButton("📖 Help", callback_data="help"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+            InlineKeyboardButton("Help", callback_data="help"),
+            InlineKeyboardButton("Settings", callback_data="settings"),
         ],
         [
-            InlineKeyboardButton("🎨 Modes", callback_data="modes"),
-            InlineKeyboardButton("📊 Stats", callback_data="stats"),
+            InlineKeyboardButton("Modes", callback_data="modes"),
+            InlineKeyboardButton("Stats", callback_data="stats"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    first_name = html.escape(update.effective_user.first_name or "User")
+    
     welcome_text = (
         f"<b>🤖 Welcome to Theriyadhu Bot!</b>\n\n"
-        f"Hello {html.escape(update.effective_user.first_name)}! "
-        f"I'm an advanced AI assistant powered by Groq.\n\n"
+        f"Hello {first_name}! I'm an advanced AI assistant.\n\n"
         f"<b>Quick Start:</b>\n"
         f"• Send me any message to chat\n"
         f"• Use /help for all commands\n"
-        f"• Try different modes with /mode\n"
-        f"• Check your usage with /stats\n\n"
+        f"• Change my personality with /mode\n\n"
         f"<i>Your role: {user['role'].value}</i>"
     )
     
@@ -757,77 +823,41 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin = user_id in cfg.admin_user_ids
     
     help_text = (
-        "<b>📖 Command Reference</b>\n\n"
+        "<b> Command Reference</b>\n\n"
         "<b>Basic Commands:</b>\n"
-        "• /start - Welcome message and quick menu\n"
+        "• /start - Welcome message\n"
         "• /help - This help message\n"
-        "• /mode [type] - Change AI personality\n"
+        "• /mode - Change AI personality\n"
         "• /reset - Clear conversation history\n"
         "• /stats - View your usage statistics\n"
-        "• /settings - Configure preferences\n"
         "• /ping - Check bot latency\n\n"
-        "<b>Conversation:</b>\n"
-        "• /summarize - Get conversation summary\n"
-        "• /export - Export chat history\n"
-        "• /search [query] - Search in history\n\n"
-        "<b>Available Modes:</b>\n"
-        "• default - Balanced assistant\n"
-        "• coder - Programming expert\n"
-        "• teacher - Educational focus\n"
-        "• creative - Creative writing\n"
-        "• analyst - Data analysis\n"
-        "• short - Brief responses\n"
+        "<b>Available Modes:</b> " + ", ".join(SYSTEM_PROMPTS.keys())
     )
     
     if is_admin:
         help_text += (
-            "\n<b>Admin Commands:</b>\n"
-            "• /admin - Admin control panel\n"
-            "• /broadcast [message] - Send to all users\n"
-            "• /ban [user_id] - Ban a user\n"
-            "• /unban [user_id] - Unban a user\n"
-            "• /upgrade [user_id] [days] - Give premium\n"
-            "• /system - System information\n"
-            "• /logs - View recent logs\n"
+            "\n\n<b>Admin Commands:</b>\n"
+            "• /admin - Control panel\n"
+            "• /system - System info\n"
         )
     
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+    # If it's a callback query, edit the message
+    if update.callback_query:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="start")]]
+        await update.callback_query.message.edit_text(
+            help_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 @track_usage("mode")
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     
     if not args:
-        current_mode = context.user_data.get("mode", "default")
-        
-        # Create mode selection keyboard
-        keyboard = []
-        for i in range(0, len(SYSTEM_PROMPTS), 2):
-            row = []
-            modes = list(SYSTEM_PROMPTS.keys())[i:i+2]
-            for mode in modes:
-                emoji = {
-                    "default": "🤖",
-                    "coder": "💻",
-                    "teacher": "📚",
-                    "creative": "🎨",
-                    "analyst": "📊",
-                    "short": "⚡"
-                }.get(mode, "🔧")
-                row.append(InlineKeyboardButton(
-                    f"{emoji} {mode.title()}",
-                    callback_data=f"mode_{mode}"
-                ))
-            keyboard.append(row)
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            f"<b>🎛 Current mode:</b> {html.escape(current_mode)}\n\n"
-            "Select a mode from below:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup
-        )
+        await show_mode_selection(update, context)
         return
     
     mode = args[0].lower()
@@ -838,13 +868,65 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    await set_mode(update, context, mode)
+
+async def show_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_mode = context.user_data.get("mode", "default")
+
+    keyboard = []
+    row = []
+    for i, mode_name in enumerate(SYSTEM_PROMPTS.keys()):
+        emoji = {
+            "default": "🤖", "coder": "💻", "teacher": "📚",
+            "creative": "🎨", "analyst": "📊", "short": "⚡"
+        }.get(mode_name, "🔧")
+        
+        row.append(InlineKeyboardButton(
+            f"{emoji} {mode_name.title()}",
+            callback_data=f"mode_{mode_name}"
+        ))
+        
+        if (i + 1) % 2 == 0:
+            keyboard.append(row)
+            row = []
+            
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="start")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = f"<b>🎛 Select AI Mode</b>\nCurrent: <i>{current_mode}</i>"
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+
+async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
     context.user_data["mode"] = mode
     context.user_data["system_prompt"] = SYSTEM_PROMPTS[mode]
     
-    await update.message.reply_text(
-        f"✅ Mode changed to <b>{html.escape(mode)}</b>",
-        parse_mode=ParseMode.HTML
-    )
+    # Clear history on mode change for a fresh start with the new persona
+    conv_manager: ConversationManager = context.application.bot_data["conversation_manager"]
+    if update.effective_user:
+        conv_manager.clear_history(update.effective_user.id)
+
+    text = f"✅ Mode changed to <b>{html.escape(mode)}</b>. Conversation history cleared."
+    
+    if update.callback_query:
+        # Answer the callback query first
+        await update.callback_query.answer()
+        # Edit the message to show confirmation
+        await update.callback_query.message.edit_text(
+            text, parse_mode=ParseMode.HTML
+        )
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @track_usage("reset")
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,38 +934,46 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     conv_manager.clear_history(user_id)
+    # Preserve mode settings
+    mode = context.user_data.get("mode")
+    prompt = context.user_data.get("system_prompt")
     context.user_data.clear()
+    if mode: context.user_data["mode"] = mode
+    if prompt: context.user_data["system_prompt"] = prompt
+
     
     await update.message.reply_text(
-        "🧹 <b>Conversation reset!</b>\n"
-        "Your chat history has been cleared.",
+        "🧹 <b>Conversation reset!</b>",
         parse_mode=ParseMode.HTML
     )
 
 @track_usage("stats")
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_manager: UserManager = context.application.bot_data["user_manager"]
-    analytics: Analytics = context.application.bot_data["analytics"]
     user_id = update.effective_user.id
     
     user = await user_manager.get_user(user_id)
-    user_stats = await analytics.get_stats("all")
     
     stats_text = (
         f"<b>📊 Your Statistics</b>\n\n"
-        f"<b>Account Info:</b>\n"
         f"• Role: {user['role'].value}\n"
         f"• Member since: {user['created_at'][:10]}\n"
         f"• Messages sent: {user.get('message_count', 0)}\n"
-        f"• Tokens used: {user.get('tokens_used', 0):,}\n"
+        f"• Tokens (est.): {user.get('tokens_used', 0):,}\n"
     )
     
-    if user['role'] == UserRole.PREMIUM:
-        expires = user.get('subscription_expires')
-        if expires:
-            stats_text += f"• Premium expires: {expires[:10]}\n"
-    
-    await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+    if user['role'] == UserRole.PREMIUM and user.get('subscription_expires'):
+        stats_text += f"• Premium until: {user['subscription_expires'][:10]}\n"
+
+    if update.callback_query:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="start")]]
+        await update.callback_query.message.edit_text(
+            stats_text, 
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
 
 @track_usage("ping")
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -893,14 +983,11 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     latency_ms = int((end_time - start_time) * 1000)
     
-    # Get system stats
-    groq_client = context.application.bot_data["groq_client"]
+    groq_client: EnhancedGroqClient = context.application.bot_data["groq_client"]
     
     await message.edit_text(
-        f"<b>🏓 Pong!</b>\n\n"
-        f"• Latency: <code>{latency_ms}ms</code>\n"
-        f"• Groq requests: {groq_client.request_count}\n"
-        f"• Errors: {groq_client.error_count}",
+        f"<b>Pong!</b> <code>{latency_ms}ms</code>\n"
+        f"<i>API Requests: {groq_client.request_count}, Errors: {groq_client.error_count}</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -915,116 +1002,109 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-            InlineKeyboardButton("🔧 Settings", callback_data="admin_settings"),
-        ],
-        [
             InlineKeyboardButton("📝 Logs", callback_data="admin_logs"),
-            InlineKeyboardButton("🔄 Restart", callback_data="admin_restart"),
         ],
+         [InlineKeyboardButton("🔙 Back", callback_data="start")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "<b>🔧 Admin Control Panel</b>\n\n"
-        "Select an action:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup
-    )
+    text = "<b>🔧 Admin Control Panel</b>"
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
 
 @admin_only
+@track_usage("system")
 async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import psutil
     import platform
     
-    # Get system info
-    cpu_percent = psutil.cpu_percent(interval=1)
+    cpu_percent = psutil.cpu_percent(interval=0.5)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
     
-    groq_client = context.application.bot_data["groq_client"]
-    user_manager = context.application.bot_data["user_manager"]
+    groq_client: EnhancedGroqClient = context.application.bot_data["groq_client"]
+    user_manager: UserManager = context.application.bot_data["user_manager"]
     
     system_text = (
-        f"<b>🖥 System Information</b>\n\n"
-        f"<b>Server:</b>\n"
-        f"• OS: {platform.system()} {platform.release()}\n"
-        f"• Python: {platform.python_version()}\n"
-        f"• CPU Usage: {cpu_percent}%\n"
-        f"• Memory: {memory.percent}% ({memory.used // (1024**3)}GB/{memory.total // (1024**3)}GB)\n"
-        f"• Disk: {disk.percent}% used\n\n"
+        f"<b>🖥 System Status</b>\n\n"
+        f"• CPU: {cpu_percent}%\n"
+        f"• RAM: {memory.percent}% Used\n"
+        f"• Uptime: {get_uptime()}\n\n"
         f"<b>Bot Stats:</b>\n"
-        f"• Active users: {len(user_manager.users)}\n"
-        f"• API requests: {groq_client.request_count}\n"
-        f"• API errors: {groq_client.error_count}\n"
-        f"• Uptime: {get_uptime()}"
+        f"• Users: {len(user_manager.users)}\n"
+        f"• Groq API: {groq_client.request_count} requests, {groq_client.error_count} errors"
     )
     
-    await update.message.reply_text(system_text, parse_mode=ParseMode.HTML)
+    if update.callback_query and update.callback_query.data == "admin_stats":
+         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin")]]
+         await update.callback_query.message.edit_text(
+             system_text,
+             parse_mode=ParseMode.HTML,
+             reply_markup=InlineKeyboardMarkup(keyboard)
+         )
+    else:
+        await update.message.reply_text(system_text, parse_mode=ParseMode.HTML)
 
 def get_uptime():
-    """Calculate bot uptime"""
     if not hasattr(get_uptime, 'start_time'):
-        get_uptime.start_time = time.time()
-    
+        return "N/A"
     uptime_seconds = int(time.time() - get_uptime.start_time)
     days = uptime_seconds // 86400
     hours = (uptime_seconds % 86400) // 3600
     minutes = (uptime_seconds % 3600) // 60
-    
     return f"{days}d {hours}h {minutes}m"
 
 # ========================== CALLBACK HANDLERS ==========================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query: return
+
+    # Acknowledge the query to remove the loading indicator
     await query.answer()
     
     data = query.data
-    
-    if data == "help":
+    logger.debug(f"Callback received: {data}")
+
+    if data == "start":
+        await cmd_start(update, context)
+    elif data == "help":
         await cmd_help(update, context)
     elif data == "settings":
         await show_settings(update, context)
+    elif data == "modes":
+        await show_mode_selection(update, context)
     elif data.startswith("mode_"):
         mode = data.replace("mode_", "")
-        context.user_data["mode"] = mode
-        context.user_data["system_prompt"] = SYSTEM_PROMPTS[mode]
-        await query.message.edit_text(
-            f"✅ Mode changed to <b>{html.escape(mode)}</b>",
-            parse_mode=ParseMode.HTML
-        )
+        await set_mode(update, context, mode)
     elif data == "stats":
         await cmd_stats(update, context)
-    # Add more callback handlers as needed
+    elif data == "admin":
+        await cmd_admin(update, context)
+    elif data == "admin_stats":
+        await cmd_system(update, context)
+    # Add more handlers (admin_users, admin_broadcast, etc.)
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [
-            InlineKeyboardButton("🎨 Change Mode", callback_data="settings_mode"),
-            InlineKeyboardButton("🔔 Notifications", callback_data="settings_notif"),
-        ],
-        [
-            InlineKeyboardButton("🌐 Language", callback_data="settings_lang"),
-            InlineKeyboardButton("📊 Data Export", callback_data="settings_export"),
-        ],
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
+        [InlineKeyboardButton("🎨 Change Mode", callback_data="modes")],
+        [InlineKeyboardButton("🔙 Back", callback_data="start")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     settings_text = (
         "<b>⚙️ Settings</b>\n\n"
-        f"• Current mode: {context.user_data.get('mode', 'default')}\n"
-        f"• Notifications: {'On' if context.user_data.get('notifications', True) else 'Off'}\n"
-        f"• Language: English\n"
+        f"• Current Mode: <code>{context.user_data.get('mode', 'default')}</code>"
     )
     
     if update.callback_query:
         await update.callback_query.message.edit_text(
-            settings_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup
-        )
-    else:
-        await update.message.reply_text(
             settings_text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup
@@ -1036,6 +1116,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     
+    user_text = update.message.text.strip()
+    if not user_text: return
+
     cfg: Config = context.application.bot_data["config"]
     groq: EnhancedGroqClient = context.application.bot_data["groq_client"]
     limiter: EnhancedRateLimiter = context.application.bot_data["rate_limiter"]
@@ -1046,68 +1129,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = await user_manager.get_user(user_id)
     
-    # Check if banned
+    # Check ban
     if user['role'] == UserRole.BANNED:
-        await update.message.reply_text(
-            "❌ You have been banned from using this bot.",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text("❌ You are banned.")
         return
     
-    # Rate limiting
+    # Rate limit
     allowed, retry_after = limiter.allow(user_id, user['role'])
     if not allowed:
-        await update.message.reply_text(
-            f"⏳ Rate limit reached. Try again in {retry_after}s",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"⏳ Wait {retry_after}s.")
         return
     
-    user_text = update.message.text.strip()
-    
-    # Check for group mention requirement
+    # Group mention check
     if cfg.enable_group_only_on_mention and update.message.chat.type in ("group", "supergroup"):
-        bot_username = context.bot.username
-        if f"@{bot_username}" not in user_text:
-            return
+        if not update.message.is_topic_message and context.bot.username not in user_text:
+             return
+
+    # Log and update stats
+    logger.info(f"Msg from {user_id}: {user_text[:50]}")
+    await user_manager.update_user(user_id, {"message_count": user.get("message_count", 0) + 1})
     
-    # Log message
-    logger.info(f"User {user_id} ({update.effective_user.username}): {user_text[:100]}")
-    
-    # Update user stats
-    await user_manager.update_user(user_id, {
-        "message_count": user.get("message_count", 0) + 1,
-        "last_message": datetime.now().isoformat()
-    })
-    
-    # Track analytics
-    await analytics.track_event("message", user_id, {
-        "length": len(user_text),
-        "chat_type": update.message.chat.type
-    })
-    
-    # Get conversation history
+    # Prepare conversation
     history = conv_manager.get_history(user_id)
-    
-    # Build messages for API
     system_prompt = context.user_data.get("system_prompt", SYSTEM_PROMPTS["default"])
     messages = [{"role": "system", "content": system_prompt}]
     
-    # Add summary if conversation is long
-    if len(history) > 8:
+    # Add summary for long context
+    if len(history) > cfg.history_max_messages - 3:
         summary = await conv_manager.summarize_conversation(user_id, groq)
         if summary:
-            messages.append({"role": "system", "content": f"Previous context: {summary}"})
-    
+            messages.append({"role": "system", "content": f"Context: {summary}"})
+
     # Add recent history
-    for msg in history[-10:]:
+    for msg in history[-(cfg.history_max_messages-2):]:
         messages.append({"role": msg["role"], "content": msg["content"]})
     
-    # Add current message
     messages.append({"role": "user", "content": user_text})
     
     try:
-        # Show typing indicator
         async with TypingAction(context, update.effective_chat.id):
             response = await groq.chat_completion(
                 messages,
@@ -1115,40 +1174,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 max_tokens=cfg.max_tokens
             )
     except Exception as e:
-        logger.error(f"API Error for user {user_id}: {e}")
-        await update.message.reply_text(
-            "⚠️ <b>Error processing your request</b>\n"
-            "Please try again later or use /reset to clear the conversation.",
-            parse_mode=ParseMode.HTML
-        )
+        logger.error(f"API Error for {user_id}: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Error. Try /reset.")
         return
     
-    # Format and sanitize response
+    # Format and send
     formatter = TextFormatter()
-    formatted_response = formatter.markdown_to_html(response)
-    safe_html = formatter.sanitize_html(formatted_response)
+    safe_html = formatter.sanitize_html(formatter.markdown_to_html(response))
     
-    # Split into chunks if needed
-    chunks = formatter.split_message(safe_html)
-    
-    # Send response
-    for i, chunk in enumerate(chunks):
+    for chunk in formatter.split_message(safe_html):
         try:
             await update.message.reply_text(
-                chunk,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False
+                chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True
             )
-        except Exception as e:
-            logger.error(f"Failed to send chunk {i}: {e}")
-            # Try sending without formatting as fallback
-            await update.message.reply_text(chunk[:4000])
+        except Exception:
+             # Fallback for complex HTML issues
+             await update.message.reply_text(chunk[:4000])
+
     
-    # Update conversation history
+    # Update history and tokens
     conv_manager.add_message(user_id, "user", user_text)
     conv_manager.add_message(user_id, "assistant", response)
     
-    # Update token count (rough estimate)
     token_estimate = (len(user_text) + len(response)) // 4
     await user_manager.update_user(user_id, {
         "tokens_used": user.get("tokens_used", 0) + token_estimate
@@ -1156,93 +1203,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========================== ERROR HANDLER ==========================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception while handling update {update}:", exc_info=context.error)
-    
-    if isinstance(update, Update) and update.effective_message:
-        error_message = (
-            "💥 <b>An unexpected error occurred</b>\n\n"
-            "The error has been logged. Please try again or use /reset if the issue persists."
-        )
-        
-        try:
-            await update.effective_message.reply_text(
-                error_message,
-                parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            pass
+    logger.error(f"Update {update} caused error:", exc_info=context.error)
 
 # ========================== APPLICATION SETUP ==========================
 async def post_init(application: Application) -> None:
-    """Initialize bot after startup"""
-    bot_commands = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("help", "Show help message"),
-        BotCommand("mode", "Change AI personality"),
-        BotCommand("reset", "Clear conversation"),
-        BotCommand("stats", "View your statistics"),
-        BotCommand("settings", "Configure preferences"),
-        BotCommand("ping", "Check bot status"),
-    ]
-    await application.bot.set_my_commands(bot_commands)
-    
-    # Initialize cache connection
-    cache: CacheManager = application.bot_data["cache_manager"]
-    await cache.connect()
-    
-    logger.info("Bot initialization complete")
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start bot"),
+        BotCommand("help", "Get help"),
+        BotCommand("mode", "Change AI mode"),
+        BotCommand("reset", "Clear chat"),
+        BotCommand("stats", "Your stats"),
+        BotCommand("ping", "Bot status"),
+    ])
+    await application.bot_data["cache_manager"].connect()
+    logger.info("Bot initialized")
 
 async def shutdown(application: Application) -> None:
-    """Cleanup on shutdown"""
-    # Close Groq client
-    groq: EnhancedGroqClient = application.bot_data.get("groq_client")
-    if groq:
-        await groq.aclose()
-    
-    # Close cache connection
-    cache: CacheManager = application.bot_data.get("cache_manager")
-    if cache and cache.redis_client:
-        await cache.redis_client.close()
-    
-    logger.info("Bot shutdown complete")
+    await application.bot_data.get("groq_client", application.bot).aclose()
+    cache = application.bot_data.get("cache_manager")
+    if cache and cache.redis_client: await cache.redis_client.aclose()
+    logger.info("Bot shutdown")
 
 def build_application(cfg: Config) -> Application:
-    """Build and configure the application"""
+    # ✅ Force tzlocal to always return a pytz timezone (IST) BEFORE builder is called
+    pytz_ist = pytz.timezone("Asia/Kolkata")
+    tzlocal.get_localzone = lambda *a, **kw: pytz_ist
+
     builder = ApplicationBuilder().token(cfg.telegram_bot_token)
-    
-    # Configure for webhook if enabled
+
     if cfg.use_webhook and cfg.webhook_url:
-        builder.url(cfg.webhook_url)
-        builder.webhook_url(f"{cfg.webhook_url}/{cfg.telegram_bot_token}")
-        builder.port(cfg.webhook_port)
-    
+        builder.webhook_url(f"{cfg.webhook_url}/{cfg.telegram_bot_token}").port(cfg.webhook_port)
+
     app = builder.build()
-    
-    # Initialize components
+
+    # Your other initializations and handlers…
     cache_manager = CacheManager(cfg.redis_url)
-    user_manager = UserManager(cache_manager, cfg.encryption_key)
-    groq_client = EnhancedGroqClient(
-        api_key=cfg.groq_api_key,
-        model=cfg.groq_model,
-        timeout=cfg.request_timeout,
-        max_retries=cfg.max_retries,
-        backoff_base=cfg.retry_backoff_base,
-        cache_manager=cache_manager
-    )
-    
-    # Store in bot_data
-    app.bot_data["config"] = cfg
-    app.bot_data["cache_manager"] = cache_manager
-    app.bot_data["user_manager"] = user_manager
-    app.bot_data["groq_client"] = groq_client
-    app.bot_data["rate_limiter"] = EnhancedRateLimiter(
-        cfg.rate_limit_window_sec,
-        cfg.rate_limit_max_calls
-    )
-    app.bot_data["conversation_manager"] = ConversationManager(cfg.history_max_messages)
-    app.bot_data["analytics"] = Analytics(cfg.enable_analytics)
-    
-    # Add handlers
+    app.bot_data.update({
+        "config": cfg,
+        "cache_manager": cache_manager,
+        "user_manager": UserManager(cache_manager, cfg.encryption_key),
+        "groq_client": EnhancedGroqClient(
+            cfg.groq_api_key, cfg.groq_model, cfg.request_timeout,
+            cfg.max_retries, cfg.retry_backoff_base, cache_manager
+        ),
+        "rate_limiter": EnhancedRateLimiter(cfg.rate_limit_window_sec, cfg.rate_limit_max_calls),
+        "conversation_manager": ConversationManager(cfg.history_max_messages),
+        "analytics": Analytics(cfg.enable_analytics),
+    })
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("mode", cmd_mode))
@@ -1254,42 +1262,36 @@ def build_application(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    
-    # Add initialization and shutdown
+
     app.post_init = post_init
     app.post_shutdown = shutdown
-    
     return app
 
 # ========================== MAIN ENTRY POINT ==========================
 def main():
-    """Main entry point"""
     try:
         cfg = load_config()
-        logger.info(f"🚀 Starting Enhanced Theriyadhu Bot")
-        logger.info(f"Model: {cfg.groq_model}")
-        logger.info(f"Admin IDs: {cfg.admin_user_ids}")
-        
-        # Track startup time for uptime calculation
         get_uptime.start_time = time.time()
         
-        application = build_application(cfg)
+        logger.info(f"Starting Bot (Model: {cfg.groq_model})")
+        
+        app = build_application(cfg)
         
         if cfg.use_webhook and cfg.webhook_url:
-            logger.info(f"Starting webhook on {cfg.webhook_url}:{cfg.webhook_port}")
-            application.run_webhook(
-                listen="0.0.0.0",
-                port=cfg.webhook_port,
+            app.run_webhook(
+                listen="0.0.0.0", port=cfg.webhook_port,
                 url_path=cfg.telegram_bot_token,
                 webhook_url=f"{cfg.webhook_url}/{cfg.telegram_bot_token}"
             )
         else:
-            logger.info("Starting long polling mode")
-            application.run_polling()
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
-        logger.exception(f"Failed to start bot: {e}")
-
+        logger.critical(f"Failed to start bot: {e}", exc_info=True)
 
 if __name__ == "__main__":
+    # Ensure the script runs in the correct event loop policy on Windows
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
     main()
